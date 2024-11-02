@@ -1,5 +1,5 @@
 ---
-title: " Práctica - Convocatoria Extraordinaria"
+title: "Modelo de Clasficación"
 author: "Pablo Mendieta Ruiz"
 date: "`r Sys.Date()`"
 output: pdf_document
