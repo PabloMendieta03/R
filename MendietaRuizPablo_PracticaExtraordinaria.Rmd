@@ -1,0 +1,471 @@
+---
+title: " Práctica - Convocatoria Extraordinaria"
+author: "Pablo Mendieta Ruiz"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+Vamos a trabajar con una base de datos llamada, "Hitters", que tiene información
+(organizada en 20 variables) sobre 322 jugadores de baseball durante la
+temporada de 1986.
+
+El objetivo de esta práctica es encontrar el mejor modelo de clasificación para 
+definir en qué liga jugará cada uno de los jugadores que aparece en la base de 
+datos en la temporada de 1987 teniendo en cuenta la información de la temporada 
+anterior (1986).
+
+# A) Análisis a priori
+Analizar las variables y hacer la limpieza de datos oportuna, además de estudiar
+la relación de las variables independientes con respecto a la objetivo.
+
+```{r,  include=FALSE}
+library(readxl)
+library(inspectdf)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+library(caret)
+library(smotefamily)
+library(MASS)
+library(glmnet)
+library(caret)
+library(pROC)
+```
+
+## Descarga de la base de datos
+```{r}
+datos <- read_excel("Hitters.xlsx")
+```
+
+## Análisis de variables
+```{r}
+head(datos)
+```
+
+```{r}
+summary(datos)
+```
+```{r}
+x <- inspect_types(datos)
+show_plot(x)
+
+```
+
+Descripición de las variables:
+
+Tenemos diferentes datos que nos dan información sobre el año en el que se
+recogieron (1986) y esos mismos datos pero de toda la carrera de cada jugador
+(empiezan por C). También tenemos información sobre los años jugados y el 
+salario de cada jugador, entre otras estadísticas.
+
+Por último, tenemos variables categóricas, para poder trabajar con ellas vamos a
+pasarlas a numéricas:
+
+La liga 'Autonómica' la asignaremos el valor 0 y a la liga 'Nacional' el valor 1.
+A la diivisión 'E' le asignaremos el valor 0 y la división 'W' el valor 1. 
+
+```{r}
+datos$NewLeague <- ifelse(datos$NewLeague == "A", 0, 
+                          ifelse(datos$NewLeague == "N", 1, datos$NewLeague))
+
+datos$League <- ifelse(datos$League == "A", 0, 
+                          ifelse(datos$League == "N", 1, datos$League))
+
+datos$Division <- ifelse(datos$Division == "E", 0, 
+                          ifelse(datos$Division == "W", 1, datos$Division))
+
+datos$NewLeague <- as.integer(datos$NewLeague)
+datos$League <- as.integer(datos$League)
+datos$Division <- as.integer(datos$Division)
+
+str(datos)
+```
+## Limpieza de Datos
+
+### Valores NA 
+
+Lo primero que haremos para la limpieza de datos, va a ser buescar valor NA en 
+la base, y posteriormente tomaremos una decisión de qué hacer con ellos.
+```{r}
+show_plot(inspect_na(datos))
+```
+Observando el resumen de los datos vemos que la única variable que tiene 
+valores NA es 'Salary', con un 18.3 %, como son un porcentaje relevante de los
+datos, vamos a cambiar los valores NA, por la media de los salarios.
+```{r}
+datos$Salary <- replace(datos$Salary,which(is.na(datos$Salary)),mean(datos$Salary,na.rm = TRUE))
+head(datos)
+```
+
+## Matriz de Correlación 
+
+La matriz de correlación nos muestra las correlaciones entre pares de variables,
+nos sirve para analizar la multicolinealidad entre las variables. 
+
+```{r}
+correlacion <- cor(Filter(is.numeric, datos))
+corrplot(correlacion, method = "number",  tl.cex = 0.5, number.cex = 0.4)
+```
+Hay algunas variables muy correlacionadas entre sí, es decir, nos dan la misma 
+información, por lo tanto vamos a eliminarlas, para evitar un sesgo: 
+
+* **Atbat** , **Hits** y **Runs** tienen una correlación entre ellas mayor a 0.9,
+por lo tanto vamos a eliminar las varibles **Hits** y **Runs**. 
+
+* **Years** , **CAtBat** y **CHits** tienen una correlación entre ellas mayor a 
+0.9, por lo tanto vamor a eliminar las variables **Years** y **CAtBat**.
+
+* **CRuns** , **CRBI** y **CWalks** tienen una correlación entre ellas mayor a 
+0.9, por lo tanto vamor a eliminar las variables **CRBI** y **CWalks**.
+
+* **HmRun** y **RBI** tienen una correlción de un 0.82, vamos a eliminar, **RBI**
+debido a que tiene una menor correlación con la variable objetivo, por lo 
+que nos da menos información.
+
+```{r}
+datosLimpios <- subset(datos, select=-c(Hits,Runs,RBI,Years,CAtBat,CRBI,CWalks,CRuns))
+head(datosLimpios)
+```
+
+```{r}
+correlacion <- cor(Filter(is.numeric, datosLimpios))
+corrplot(correlacion, method = "number",  tl.cex = 0.8, number.cex = 0.7)
+```
+Estudio de las distribuciones de las variables:
+```{r}
+Distribuciones <- inspect_num(datosLimpios)
+show_plot(Distribuciones)
+```
+La mayoria de las variables sigue una distribución de chi cuadrado, salvo la 
+variable "AtBat" que parece seguir una distribución normal. También podemos
+ver en "Salary" una anomalía, que viene dada por los valores NA que hemos 
+cambiado por la media. 
+
+## Relación de las variables independientes con la variable objetivo
+
+Estudiamos que posibles variables tienen influencia sobre la variable objetivo.
+
+```{r}
+table(datosLimpios$NewLeague,datosLimpios$League)
+```
+La variable **League** claramente tiene influencia sobre la variable objetivo.
+```{r}
+table(datosLimpios$NewLeague,datosLimpios$Division)
+```
+En Cambio, **Division** no nos aporta información sobre la **NewLeague**.
+```{r}
+datosLimpios <- subset(datosLimpios, select=-c(Division))
+```
+
+
+# B) Modelos de Regresión
+
+Para trabajar con la selección de modelos, lo primero que vamos a hacer es 
+serparar en datos de entrenamiento y datos de validación, para luego comprobar
+que los modelos funcionan adecuadamente con otros datos. 
+
+## Datos de train y test
+
+```{r}
+set.seed(1245)
+
+trainIndex <- createDataPartition(datosLimpios$NewLeague, p = .8, list=F)
+train <- datosLimpios[ trainIndex,]
+test  <- datosLimpios[-trainIndex,]
+```
+
+## Modelo Completo 
+
+Vamos a hacer un modelo de regresión logística completo: 
+
+$Newleague = \beta_0+\beta_1Atbat+\beta_2HmRun+\beta_3Walks+\beta_4CHits+\beta_5CHmRun\beta_6League+\beta_7PutOuts+\beta_8Assits+\beta_9Errors+\beta_1Salary + \epsilon$
+
+```{r}
+modeloCompleto <- glm(NewLeague ~., data = train, family = binomial)
+summary(modeloCompleto)
+```
+
+## Selección de variables 
+
+Para el criterio de selección de variables, vamos a usar 2 en nuestro caso: 
+
+* Akaike’s Information Criterion (AIC): El más reconmendable para mejor la
+capacidad predictiva del modelo.
+
+ $AIC = 2k - log[\underset{\Theta}{\max} verosimiltud(x;\Theta) ]$
+
+* Bayesian Information Criterion (BIC): El más recomendable para encontrar el 
+modelo más simple que represiente correctamente los datos.
+
+ $BIC = klog(n) - log[\underset{\Theta}{\max} verosimiltud(x;\Theta) ]$
+ 
+### Selección hacia delante (forward) - AIC
+
+Emprezamos con un modelo Nulo y vamos añadiendo el predictor con menor AIC, 
+repetimos sucesivamente hasta que no podamos descartar ninguna variable más:
+
+Definimos el modelo NULO: 
+```{r}
+modeloNulo <- glm(NewLeague ~ 1, family = binomial, data = train)
+```
+
+Hacemos la selección hacia delante empezando en el modelo nulo y acabando, 
+como lejos, en el modelo completo
+
+> modeloForward <- stepAIC(modeloNulo, scope = list(lower = modeloNulo, upper = modeloCompleto), direction =  "forward")
+
+```{r,  include=FALSE}
+modeloForward <- stepAIC(modeloNulo, scope = list(lower = modeloNulo, upper = modeloCompleto), direction =  "forward")
+```
+
+```{r}
+summary(modeloForward)
+```
+### Selección hacia detrás (backward) - AIC
+
+Es el mismo concepto que el anterior apartado, pero empezando con el modelo 
+completo y eliminando variables hastar llegar, como lejos al modelo nulo:
+
+> modeloBackward <- stepAIC(modeloCompleto, direction = "backward")
+
+```{r, include=FALSE}
+modeloBackward <- stepAIC(modeloCompleto, direction = "backward")
+```
+
+```{r}
+summary(modeloBackward)
+```
+
+### Selección hacia ambos lados (both) AIC
+
+Sigue el mismo concepto que la selección anterior, sin embargo, una vez 
+elimianadas las variables puede volver a añadirlas en el modelo si su AIC es
+mayor al del modelo NULO. Esto puede ocurrir en algunas ocasiones debido a una 
+alta correlación entre variables, haciendo que tenga sesgos entre ellas.
+
+> modeloBothAIC <- stepAIC(modeloCompleto, direction = "both")
+
+```{r}
+modeloBothAIC <- stepAIC(modeloCompleto, direction = "both")
+```
+
+```{r}
+summary(modeloBothAIC)
+```
+
+### Selección hacia delante (forward) - BIC
+
+Vamos a repetir los 3 mismos procesos ahora usando BIC.
+
+> modeloForwardBIC <- stepAIC(modeloNulo, scope = list(lower = modeloNulo, 
+upper = modeloCompleto), direction =  "forward", k = log(nrow(datosLimpios)))
+
+```{r, include=FALSE}
+modeloForwardBIC <- stepAIC(modeloNulo, scope = list(lower = modeloNulo, upper = modeloCompleto), direction =  "forward", k = log(nrow(datosLimpios)))
+```
+
+```{r}
+summary(modeloForwardBIC)
+```
+
+### Selección hacia detrás (backward) - BIC
+
+> modeloBackwardBIC <- stepAIC(modeloCompleto, direction = "backward", k = log(nrow(datosLimpios)))
+
+```{r, include=FALSE}
+modeloBackwardBIC <- stepAIC(modeloCompleto, direction = "backward", k = log(nrow(datosLimpios)))
+```
+
+```{r}
+summary(modeloBackwardBIC)
+```
+
+### Selección hacia ambos lados (both) - BIC
+
+> modeloBothBIC <- stepAIC(modeloCompleto, direction = "both",k = log(nrow(datosLimpios)))
+
+```{r}
+modeloBothBIC <- stepAIC(modeloCompleto, direction = "both",k = log(nrow(datosLimpios)))
+```
+
+```{r}
+summary(modeloBothBIC)
+```
+
+
+# C) Selección de un modelo
+
+Hemos generado 6 modelos, con los procesos de selección de variables, no 
+obstante, podemos resumirlos en tres modelos, vamos a seleccionar el mejor para 
+nuestro caso entre : **modeloBothBIC** , **modeloBothAIC** y **modeloCompleto**.
+
+## Comparación con ANOVA
+Vamos a usar ANOVA para comprobar si añadir variables mejora significativamente 
+el modelo. 
+
+```{r}
+anova(modeloBothBIC, modeloBothAIC, modeloCompleto, test="Chisq")
+```
+Observando el p-valor, vemos que es mayor a 0.05, por lo que  no hay evidencia 
+para añadir variables, el mejor modelo es: **NewLeague ~ League**
+
+## Comparación con cálculo estadístico 
+
+```{r}
+teststat <- -2 * (as.numeric(logLik(modeloCompleto))-as.numeric(logLik(modeloBothBIC)))
+pchisq(teststat, df = 1, lower.tail = FALSE)
+```
+El valor de p = 1, indica que no hay evidencia para rechazar la hipótesis nula, 
+es decir, el **modeloBothBIC** se ajusta tan bien a los datos como el 
+**modeloCompleto**, por lo que nos quedamos con el modelo más simple. 
+
+
+## Tasa de acierto, Sensibilidad y Especifidad
+
+Accuracy: Proporción de predicciones correctas con respecto al total de predicciones:
+$Tasa de acierto = ( VN + VP ) / (VN + VP + FN + FP)$
+
+Sensibilidad: Proporción de casos positivos reales bien identificados:
+$Sensibilidad = VP / ( VP + FN )$
+
+Especificidad: Proporción de casos negativos reales bien identificados:
+$Especifidad = VN / (VN + FP)$
+
+Calculamos primero los datos del **ModeloBothBIC**:
+```{r}
+train_tab <- table(predicted = round(predict(modeloBothBIC, type="response", newdata=train)), 
+                  actual = train$NewLeague)
+test_tab <- table(predicted = round(predict(modeloBothBIC, type="response", newdata=test)),
+                  actual = test$NewLeague)
+
+train_con_mat <- confusionMatrix(train_tab, positive = "1")
+train_con_mat
+test_con_mat <- confusionMatrix(test_tab, positive = "1")
+test_con_mat
+```
+
+Calculamos los datos el **modeloCompleto**:
+```{r}
+train_tab <- table(predicted = round(predict(modeloCompleto, type="response", newdata=train)), 
+                  actual = train$NewLeague)
+test_tab <- table(predicted = round(predict(modeloCompleto, type="response", newdata=test)),
+                  actual = test$NewLeague)
+
+train_con_mat <- confusionMatrix(train_tab, positive = "1")
+train_con_mat
+test_con_mat <- confusionMatrix(test_tab, positive = "1")
+test_con_mat
+```
+Observando los valores de la tasa de acierto, la sensibilidad y la especificidad 
+tienen los mismos valores, es decir, ambos aciertan con la misma probabilidad, 
+por lo que preferimos el modelo más simple, el **modeloBothBIC**.
+
+## Curva de ROC
+
+Por último, para comparar ambos modelos vamos a calcular el área bajo la curva 
+(AUC) de ROC : 
+```{r}
+par(pty = "s")
+ROCcurve <- roc(test$NewLeague, predict(modeloBothBIC, test, type="response"), 
+    plot=TRUE, legacy.axes=TRUE)
+```
+
+```{r}
+AUC <- auc(ROCcurve)
+print(paste("AUC: ", AUC))
+```
+
+```{r}
+par(pty = "s")
+ROCcurve1 <- roc(test$NewLeague, predict(modeloCompleto, test, type="response"), 
+    plot=TRUE, legacy.axes=TRUE)
+```
+
+```{r}
+AUC <- auc(ROCcurve1)
+print(paste("AUC: ", AUC))
+```
+En este aspecto, el AUC del **modeloCompleto** es 0.96, ligeramente mayor al AUC
+de **modeloBothBIC** , 0.93. 
+
+Teniendo en cuenta toda esta información, la mejor opción en cuanto a 
+complejidad es quedarnos con el modelo más simple: 
+
+$NewLegaue = \beta_0  + \beta_1 League + \mu$
+
+# D) Mejora del modelo óptimo  
+
+Para seleccionar el punto óptimo de corte, maximizamos el índice de Youden:
+
+$J = maximize ( SEN + SPE - 1)$
+
+Vamos a optimizar ambos modelos:
+
+Indice de Youden de **modeloBothBIC**:
+```{r}
+IndiceYouden <- ROCcurve$thresholds[which.max(ROCcurve$sensitivities + ROCcurve$specificities - 1)]
+print(IndiceYouden)
+```
+
+Indice de Youden de **modeloCompleto**:
+```{r}
+IndiceYouden1 <- ROCcurve1$thresholds[which.max(ROCcurve1$sensitivities + ROCcurve1$specificities - 1)]
+print(IndiceYouden1)
+```
+
+Nuevo Punto de corte para **modeloBothBIC**:
+```{r}
+# Predicciones de probabilidad
+train_prob <- predict(modeloBothBIC, type = "response", newdata = train)
+test_prob <- predict(modeloBothBIC, type = "response", newdata = test)
+
+# Clasificación usando el umbral óptimo
+train_pred <- ifelse(train_prob >= IndiceYouden, 1, 0)
+test_pred <- ifelse(test_prob >= IndiceYouden, 1, 0)
+
+# Evaluación de las predicciones
+train_tab <- table(predicted = train_pred, actual = train$NewLeague)
+test_tab <- table(predicted = test_pred, actual = test$NewLeague)
+
+train_con_mat <- confusionMatrix(train_tab, positive = "1")
+print(train_con_mat)
+test_con_mat <- confusionMatrix(test_tab, positive = "1")
+print(test_con_mat)
+```
+Nuevo Punto de corte para **modeloCompleto**:
+```{r}
+# Predicciones de probabilidad
+train_prob <- predict(modeloCompleto, type = "response", newdata = train)
+test_prob <- predict(modeloCompleto, type = "response", newdata = test)
+
+
+# Clasificación usando el umbral óptimo
+train_pred <- ifelse(train_prob >= IndiceYouden1, 1, 0)
+test_pred <- ifelse(test_prob >= IndiceYouden1, 1, 0)
+
+# Evaluación de las predicciones
+train_tab <- table(predicted = train_pred, actual = train$NewLeague)
+test_tab <- table(predicted = test_pred, actual = test$NewLeague)
+
+train_con_mat <- confusionMatrix(train_tab, positive = "1")
+print(train_con_mat)
+test_con_mat <- confusionMatrix(test_tab, positive = "1")
+print(test_con_mat)
+```
+
+Los resultados después de usar el punto de corte óptimo en el **modeloBothbIC**
+han sido los mismos, debido a que el índice de Youden a un valor muy cercano a 
+0.5, lo que nos indica que el modelo tiene una alta sensibilidad y especificidad,
+es decir, identifica correctamente los positivos y los negativos.
+
+En cambio, los resultados de usar el punto de corte óptimo en el
+**modeloCompleto** se ha visto reflejados en el accuracy de los datos de test, 
+de un 93.75% a un 95.31%. 
+
+
+
+
+
+
+
+
